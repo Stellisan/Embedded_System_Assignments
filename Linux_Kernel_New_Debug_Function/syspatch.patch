@@ -1,0 +1,299 @@
+diff -Naur linux3.19-r0/kernel/arch/x86/syscalls/syscall_32.tbl linux3.19-r0_m/kernel/arch/x86/syscalls/syscall_32.tbl
+--- linux3.19-r0/kernel/arch/x86/syscalls/syscall_32.tbl	2017-06-17 10:44:31.000000000 -0700
++++ linux3.19-r0_m/kernel/arch/x86/syscalls/syscall_32.tbl	2020-05-01 07:21:24.123153946 -0700
+@@ -365,3 +365,5 @@
+ 356	i386	memfd_create		sys_memfd_create
+ 357	i386	bpf			sys_bpf
+ 358	i386	execveat		sys_execveat			stub32_execveat
++359	i386	insdump			sys_insdump
++360	i386	rmdump			sys_rmdump
+\ No newline at end of file
+diff -Naur linux3.19-r0/kernel/include/linux/dynamic_dump_stack.h linux3.19-r0_m/kernel/include/linux/dynamic_dump_stack.h
+--- linux3.19-r0/kernel/include/linux/dynamic_dump_stack.h	1969-12-31 17:00:00.000000000 -0700
++++ linux3.19-r0_m/kernel/include/linux/dynamic_dump_stack.h	2020-05-01 11:18:01.882974000 -0700
+@@ -0,0 +1,3 @@
++extern int remove_dump_stacks(int pid);
++
++typedef int dumpmode_t;
+\ No newline at end of file
+diff -Naur linux3.19-r0/kernel/include/linux/syscalls.h linux3.19-r0_m/kernel/include/linux/syscalls.h
+--- linux3.19-r0/kernel/include/linux/syscalls.h	2017-06-17 10:44:57.000000000 -0700
++++ linux3.19-r0_m/kernel/include/linux/syscalls.h	2020-05-01 19:12:14.454786796 -0700
+@@ -79,6 +79,7 @@
+ #include <linux/quota.h>
+ #include <linux/key.h>
+ #include <trace/syscall.h>
++#include <linux/dynamic_dump_stack.h>
+ 
+ /*
+  * __MAP - apply a macro to syscall arguments
+@@ -882,4 +883,8 @@
+ 			const char __user *const __user *argv,
+ 			const char __user *const __user *envp, int flags);
+ 
++asmlinkage long sys_insdump(const char __user *symbolname, dumpmode_t dumpmode);
++
++asmlinkage long sys_rmdump(unsigned int dumpid);
++
+ #endif
+diff -Naur linux3.19-r0/kernel/kernel/exit.c linux3.19-r0_m/kernel/kernel/exit.c
+--- linux3.19-r0/kernel/kernel/exit.c	2017-06-17 10:44:58.000000000 -0700
++++ linux3.19-r0_m/kernel/kernel/exit.c	2020-05-01 19:14:36.625889896 -0700
+@@ -53,6 +53,7 @@
+ #include <linux/oom.h>
+ #include <linux/writeback.h>
+ #include <linux/shm.h>
++#include <linux/dynamic_dump_stack.h>
+ 
+ #include <asm/uaccess.h>
+ #include <asm/unistd.h>
+@@ -655,6 +656,10 @@
+ 	int group_dead;
+ 	TASKS_RCU(int tasks_rcu_i);
+ 
++	#ifdef CONFIG_DYNAMIC_DUMP_STACK
++		remove_dump_stacks(tsk->pid);
++	#endif
++
+ 	profile_task_exit(tsk);
+ 
+ 	WARN_ON(blk_needs_flush_plug(tsk));
+diff -Naur linux3.19-r0/kernel/lib/dynamic_dump_stack.c linux3.19-r0_m/kernel/lib/dynamic_dump_stack.c
+--- linux3.19-r0/kernel/lib/dynamic_dump_stack.c	1969-12-31 17:00:00.000000000 -0700
++++ linux3.19-r0_m/kernel/lib/dynamic_dump_stack.c	2020-05-01 20:50:00.987968000 -0700
+@@ -0,0 +1,209 @@
++#include<linux/kernel.h>
++#include<linux/init.h>
++#include<linux/sched.h>
++#include<linux/syscalls.h>
++#include<linux/string.h>
++#include<linux/kprobes.h>
++#include<linux/kallsyms.h>
++#include<linux/module.h>
++#include <linux/types.h>
++#include <linux/slab.h>
++#include <linux/dynamic_dump_stack.h>
++
++// Dumpstack structure
++struct dumpstack{
++	struct task_struct* owner;
++	struct kprobe p;
++	dumpmode_t mode;
++	struct list_head list_pt;
++	int id;
++};
++
++// Head node for the linked list 
++struct list_head Head;
++// Initialize the Head node
++LIST_HEAD(Head);
++
++// ID for the stack dumps
++static int dumpid;
++
++// to store the temporary list of all the kprobes added by the exiting process
++struct delete_node {
++	struct list_head listnode;
++	struct list_head* address;	
++};
++
++// Function Name:	remove_dump_stacks
++//
++// Arguments: 		pid - process id
++//
++// Description:		This function will be called from do_quit function. 
++//			Which will be called when a process is terminating.
++//			
++int remove_dump_stacks(int pid)
++{
++    	struct list_head* iter = NULL;
++    	struct dumpstack* struct_iter = NULL;
++	
++	struct delete_node *delList, *temp = NULL;
++    	struct list_head nodes_to_delete = LIST_HEAD_INIT(nodes_to_delete);
++  
++	if(list_empty_careful(&Head))
++	{	
++		return 0;
++	}
++
++	// find all the kprobes added by the process
++    	list_for_each(iter, &Head) {
++		struct_iter = list_entry(iter, struct dumpstack, list_pt);
++		if(struct_iter->owner->pid == pid) {
++			printk("\nInside Removal Function...\n");
++			printk("Process %d is exiting and the stack dump is cleared",pid);
++			unregister_kprobe(&struct_iter->p);   // unregister the kprobes
++			delList = kmalloc(sizeof(struct delete_node), GFP_KERNEL);
++			memset(delList, 0, sizeof(struct delete_node));
++			delList->address = iter;
++			list_add(&delList->listnode, &nodes_to_delete);
++		}
++    	}
++     
++
++	// delete entries from the global list 
++   	list_for_each(iter, &nodes_to_delete) {
++		temp = list_entry(iter, struct delete_node, listnode);
++		list_del(temp->address); 
++   	}
++    
++    	return 1;
++}
++
++// Prehandler for Kprobe
++int Pre_Handler(struct kprobe *probe, struct pt_regs *regs){
++	struct dumpstack* current_struct;
++	current_struct = container_of(probe, struct dumpstack, p);
++
++	// Mode = 0 Enabled for the Owner
++	if(current_struct->mode == 0 && current_struct->owner->pid == current->pid)
++	{
++		printk("\nOwner\n");
++		dump_stack();
++	}// Mode = 1 Enabled for the Owner and it's siblings 	
++	else if(current_struct->mode == 1 && current_struct->owner->real_parent->pid == current->real_parent->pid)
++	{
++		printk("\nOwner and Sibling\n");
++		dump_stack();
++	}// Enabled for all processes
++	else if(current_struct->mode != 0 && current_struct->mode != 1)
++	{
++		printk("\nAll Process\n");
++		dump_stack();
++	}
++	
++	return 0;
++}
++
++// System Call for insdump
++// Arguments:	symbolname 	- Symbol for the kprobe
++// 		mode		- Mode for the stack dump enabling
++SYSCALL_DEFINE2(insdump, const char __user *, symbolname, dumpmode_t, mode)
++{
++	#ifdef CONFIG_DYNAMIC_DUMP_STACK
++	int ret;
++	unsigned long address;
++	char sym_name[50];
++	struct dumpstack* str;
++
++	printk("\nInside Syscall insdump:\n");
++
++	str = (struct dumpstack*)kmalloc(sizeof(struct dumpstack),GFP_KERNEL);
++	memset(str, 0, sizeof(struct dumpstack));
++
++	str->owner = current;
++
++	memset(&str->p, 0, sizeof(struct kprobe));
++	str->p.pre_handler = Pre_Handler;
++
++
++	strncpy_from_user(sym_name,symbolname,50);
++
++	address = kallsyms_lookup_name(sym_name);   // find the address of the symbol
++	if(address == 0){   // validate the address
++		printk(KERN_INFO "Symbol no found\n");
++		return -EINVAL;
++	}
++
++
++	str->p.addr = (kprobe_opcode_t *)address;
++	str->mode = mode;
++
++	if(!list_empty_careful(&Head))
++	{
++		struct dumpstack* stcdump;
++		list_for_each_entry(stcdump, &Head, list_pt)
++		{
++			if(stcdump->p.addr == (kprobe_opcode_t *)address && current->pid == stcdump->owner->pid)
++			{
++				printk(KERN_INFO "Already registered by the owner for the symbol\n");
++				kfree(str);
++				return -EINVAL;
++			}
++		}
++	}
++
++	ret = register_kprobe(&str->p);
++
++	if (ret < 0) {
++		printk(KERN_INFO "register_kprobe failed, returned %d\n", ret);
++		kfree(str);
++		return ret;
++	}
++
++	printk(KERN_INFO "kprobe inserted at %p from Owner PID: %d", str->p.addr,str->owner->pid);
++
++	str->id = ++dumpid;
++
++	list_add_tail(&str->list_pt, &Head);
++	return dumpid;
++	#endif
++	return 0;
++}
++
++
++// System Call for rmdump
++// Arguments:	dumpid 	- ID for the dumpstack
++SYSCALL_DEFINE1(rmdump, unsigned int, dumpid)
++{
++	#ifdef CONFIG_DYNAMIC_DUMP_STACK
++	struct dumpstack* stcdump;
++	int check = 0;
++	
++	printk("\nInside Syscall rmdump:\n");
++	// check for if the dumpid exists and the current process id is the same as owner id
++	list_for_each_entry(stcdump, &Head, list_pt)
++	{
++		if(stcdump->id == dumpid && stcdump->owner->pid == current->pid)
++		{
++			printk("Found the Dumpstack");
++			unregister_kprobe(&stcdump->p);
++			list_del(&stcdump->list_pt);
++			check = 1;
++			break;
++		}
++	}
++
++	if(check == 0)
++	{
++		printk("\nCould not remove the Stack Dump from PID: %d\n",current->pid);
++		return -EINVAL;
++	}
++	else
++	{
++		printk("\nRemoved the Stack Dump from PID: %d\n",current->pid);
++	}
++
++	return 1;
++	#endif
++
++	return 0;
++}
++
+diff -Naur linux3.19-r0/kernel/lib/Kconfig.debug linux3.19-r0_m/kernel/lib/Kconfig.debug
+--- linux3.19-r0/kernel/lib/Kconfig.debug	2017-06-17 10:44:58.000000000 -0700
++++ linux3.19-r0_m/kernel/lib/Kconfig.debug	2020-05-01 07:07:07.296213880 -0700
+@@ -1,3 +1,10 @@
++config DYNAMIC_DUMP_STACK
++	bool "Enable dynamic dump stack"
++	default n
++	help
++	  Enable this option for dynamically add dump_stack in symbols.
++	  If not sure, say N.
++
+ menu "printk and dmesg options"
+ 
+ config PRINTK_TIME
+diff -Naur linux3.19-r0/kernel/lib/Makefile linux3.19-r0_m/kernel/lib/Makefile
+--- linux3.19-r0/kernel/lib/Makefile	2017-06-17 10:44:58.000000000 -0700
++++ linux3.19-r0_m/kernel/lib/Makefile	2020-05-01 09:59:28.629551923 -0700
+@@ -168,6 +168,8 @@
+ 
+ obj-$(CONFIG_FONT_SUPPORT) += fonts/
+ 
++obj-y += dynamic_dump_stack.o
++
+ hostprogs-y	:= gen_crc32table
+ clean-files	:= crc32table.h
+ 
